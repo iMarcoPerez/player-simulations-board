@@ -26,6 +26,14 @@
  *     defenses, gameCtx, diag) from data/detail_<sport>_<n>.json —
  *     the app.db extra_json the artifact itself renders, never a
  *     substitute feed.
+ *   - getPlayer also attaches the player's volume table: the
+ *     app.db volume_tables slice (base64(gzip(JSON)), staged verbatim
+ *     in data/volume_<sport>_<n>.json with data/volume_<sport>_index.json)
+ *     is gunzipped here (DecompressionStream) and attached as
+ *     player.volumeTables, and the faced-lines map the server derives
+ *     from it is attached as player.logLines — the same objects the
+ *     real getPlayer returns. No slice -> volumeTables null, logLines
+ *     null, exactly like the server.
  *   - getGames splits each game's stored evidence into
  *     evAway / evHome / h2h / notes and fills projection/book defaults.
  *   - getGrades maps the stored grade meta to `summary`.
@@ -49,7 +57,7 @@
  * { data: <payload> } on success, { error: <message> } on failure.
  */
 
-const VERSION = "2026-11-10.2";
+const VERSION = "2026-11-11.1";
 const DATA_CACHE = "psb-data-" + VERSION;
 const STATIC_CACHE = "psb-static-" + VERSION;
 
@@ -208,6 +216,97 @@ async function extraFor(sport, pkey) {
     };
   }
   return { ...EXTRA_DEFAULTS };
+}
+
+/* Per-player volume-table slices for a sport, as a Map
+ * pkey -> base64(gzip(JSON)) string, from the staged shards. */
+async function volumeMap(sport) {
+  return memoized("volume:" + sport, async () => {
+    const index = await fetchJSON(`data/volume_${sport}_index.json`);
+    if (!index) return null;
+    const shardNums = [...new Set(Object.values(index))].sort(
+      (a, b) => a - b,
+    );
+    const shards = await Promise.all(
+      shardNums.map((n) => fetchJSON(`data/volume_${sport}_${n}.json`)),
+    );
+    const map = new Map();
+    for (const shard of shards) {
+      if (!shard) continue;
+      for (const [pkey, gz64] of Object.entries(shard)) map.set(pkey, gz64);
+    }
+    return map;
+  });
+}
+
+/* Gunzip one stored slice: base64 -> gzip bytes -> JSON text.
+ * Mirrors the artifact's privileged decodeVolumeSlice contract. */
+async function gunzipB64(gz64) {
+  const bin = atob(gz64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const stream = new Blob([bytes])
+    .stream()
+    .pipeThrough(new DecompressionStream("gzip"));
+  return await new Response(stream).text();
+}
+
+/* The player's parsed volume-table payload, or null when there is
+ * no slice or it does not decode/parse — the server's behavior. */
+async function volumeFor(sport, pkey) {
+  const slices = await volumeMap(sport);
+  const gz64 = slices?.get(pkey) ?? null;
+  if (!gz64) return null;
+  try {
+    const parsed = JSON.parse(await gunzipB64(gz64));
+    return parsed && Array.isArray(parsed.families) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/* Faced lines per logged game, keyed the way the card's logs are
+ * keyed — a direct port of the server handler's derivation from
+ * the volume payload (same family->stat map, same log keys). */
+function computeLogLines(volumeTables) {
+  if (!volumeTables) return null;
+  const famToStat =
+    volumeTables.sport === "nfl"
+      ? {
+          passing_yards: "pass_yds",
+          pass_attempts: "pass_att",
+          pass_tds: "pass_tds",
+          rushing_yards: "rush_yds",
+          carries: "rush_att",
+          receiving_yards: "rec_yds",
+          receptions: "rec",
+          targets: "targets",
+          rush_rec_yards: "rush_rec_yds",
+        }
+      : {
+          PTS: "pts",
+          REB: "reb",
+          AST: "ast",
+          "3PM": "tpm",
+          PRA: "pra",
+          PR: "pr",
+          PA: "pa",
+          RA: "ra",
+        };
+  const built = {};
+  for (const fam of volumeTables.families) {
+    const statKey = famToStat[fam.key];
+    if (!statKey) continue;
+    for (const row of fam.rows) {
+      if (row.prop_line == null) continue;
+      const logKey =
+        volumeTables.sport === "nfl"
+          ? `${row.season} Wk ${row.week ?? ""}`
+          : row.game_date;
+      (built[statKey] ??= {})[logKey] = row.prop_line;
+    }
+  }
+  return Object.keys(built).length > 0 ? built : null;
 }
 
 /* The complete Trends payload: header fields + the players array
@@ -581,6 +680,7 @@ async function handleActions(request) {
         const found = (board.players || []).find((p) => p.pkey === args.pkey) || null;
         if (!found) return ok({ player: null });
         const extra = await extraFor(sport, args.pkey);
+        const volumeTables = await volumeFor(sport, args.pkey);
         const player = {
           ...found,
           ucl90: found.splits?.ucl90 ?? null,
@@ -594,6 +694,8 @@ async function handleActions(request) {
           splits: found.splits ?? null,
           extra,
           logs: Array.isArray(found.logs) ? found.logs : [],
+          volumeTables,
+          logLines: computeLogLines(volumeTables),
         };
         return ok({ player });
       }
